@@ -1,0 +1,31 @@
+{
+  "name": "cma-flux",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k -n server,client -c blue,green \"node --watch server/index.mjs\" \"vite\"",
+    "dev:server": "node --watch server/index.mjs",
+    "dev:client": "vite",
+    "build": "vite build",
+    "start": "node server/index.mjs"
+  },
+  "dependencies": {
+    "@xyflow/react": "^12.8.2",
+    "better-sqlite3": "^12.2.0",
+    "express": "^5.1.0",
+    "lucide-react": "^0.544.0",
+    "nanoid": "^5.1.5",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.13",
+    "@types/react-dom": "^19.1.9",
+    "@vitejs/plugin-react": "^5.0.2",
+    "concurrently": "^9.2.1",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.5"
+  }
+}
