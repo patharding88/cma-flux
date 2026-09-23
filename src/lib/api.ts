@@ -41,9 +41,11 @@ export const api = {
   saveGraph: (
     id: string,
     payload: {
-      nodes: unknown[];
-      edges: unknown[];
-      viewport: { x: number; y: number; zoom: number };
+      upsertNodes: unknown[];
+      deleteNodeIds: string[];
+      upsertEdges: unknown[];
+      deleteEdgeIds: string[];
+      viewport?: { x: number; y: number; zoom: number };
       parentWorkflowId?: string | null;
       senderId: string;
     },

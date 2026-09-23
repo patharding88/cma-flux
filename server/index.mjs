@@ -18,6 +18,7 @@ import {
   storedOriginalName,
   workflowDir,
 } from "./files.mjs";
+import { applyPatch } from "../shared/graphPatch.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 8787);
@@ -75,6 +76,7 @@ function refreshLinkedParents(childId) {
     const current = getWorkflowRaw(parentId);
     if (!current) continue;
     const graph = enrichMapNodes(current.graph, getWorkflowRaw, parentId);
+    if (JSON.stringify(graph) === JSON.stringify(current.graph)) continue;
     const now = nowIso();
     const revision = current.revision + 1;
     db.prepare(
@@ -180,19 +182,19 @@ app.patch("/api/workflows/:id", (req, res) => {
 app.put("/api/workflows/:id/graph", (req, res) => {
   const current = getWorkflowRaw(req.params.id);
   if (!current) return res.status(404).json({ error: "Workflow not found" });
-  const graph = enrichMapNodes(
-    {
-      nodes: Array.isArray(req.body?.nodes) ? req.body.nodes : current.graph.nodes,
-      edges: Array.isArray(req.body?.edges) ? req.body.edges : current.graph.edges,
-      viewport: req.body?.viewport || current.graph.viewport,
-      parentWorkflowId:
-        req.body?.parentWorkflowId !== undefined
-          ? req.body.parentWorkflowId
-          : current.graph.parentWorkflowId || null,
-    },
-    getWorkflowRaw,
-    current.id,
-  );
+  const body = req.body || {};
+  const patch = {
+    upsertNodes: Array.isArray(body.upsertNodes) ? body.upsertNodes : [],
+    deleteNodeIds: Array.isArray(body.deleteNodeIds) ? body.deleteNodeIds : [],
+    upsertEdges: Array.isArray(body.upsertEdges) ? body.upsertEdges : [],
+    deleteEdgeIds: Array.isArray(body.deleteEdgeIds) ? body.deleteEdgeIds : [],
+  };
+  if (body.viewport && typeof body.viewport === "object") patch.viewport = body.viewport;
+  if (Object.prototype.hasOwnProperty.call(body, "parentWorkflowId")) {
+    patch.parentWorkflowId = body.parentWorkflowId ? String(body.parentWorkflowId) : null;
+  }
+  const patched = applyPatch(current.graph, patch);
+  const graph = enrichMapNodes(patched, getWorkflowRaw, current.id);
   const now = nowIso();
   const revision = current.revision + 1;
   db.prepare(
@@ -203,7 +205,7 @@ app.put("/api/workflows/:id/graph", (req, res) => {
     workflowId: current.id,
     revision,
     graph,
-    senderId: req.body?.senderId || null,
+    senderId: body.senderId || null,
     updatedAt: now,
   });
   refreshLinkedParents(current.id);

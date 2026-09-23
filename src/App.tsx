@@ -17,6 +17,7 @@ import { Inspector } from "./components/Inspector";
 import { CanvasBoard, makeEdge, makeNode } from "./components/CanvasBoard";
 import { GanttPanel } from "./components/GanttPanel";
 import { api } from "./lib/api";
+import { diffGraph, foldItems, mergeItems, patchIsEmpty, preferServerCopy, sameEdge, sameNode } from "./lib/graphPatch";
 import { edgeData, edgeTouchesExternal } from "./lib/edges";
 import type { EdgePatch, FluxNodeData, NodeKind, PresencePerson, WorkflowSummary } from "./types";
 import { normaliseNodeData } from "./lib/teams";
@@ -31,6 +32,17 @@ import {
 
 const CLIENT_KEY = "cma-flux-client";
 const NAME_KEY = "cma-flux-name";
+
+type RemoteGraph = {
+  workflowId?: string;
+  revision?: number;
+  senderId?: string | null;
+  graph?: {
+    nodes?: unknown;
+    edges?: unknown;
+    parentWorkflowId?: string | null;
+  };
+};
 
 function clientId() {
   const existing = sessionStorage.getItem(CLIENT_KEY);
@@ -126,6 +138,17 @@ export default function App() {
   const historyIndex = useRef(-1);
   const clipboard = useRef<{ nodes: Node<FluxNodeData>[]; edges: Edge[] } | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
+  const serverRef = useRef<{
+    nodes: Node<FluxNodeData>[];
+    edges: Edge[];
+    parentWorkflowId: string | null;
+  }>({ nodes: [], edges: [], parentWorkflowId: null });
+  const revisionRef = useRef(0);
+  const viewportDirty = useRef(false);
+  const saveFlight = useRef(false);
+  const saveAgain = useRef(false);
+  const lastSentRef = useRef<{ nodes: Node<FluxNodeData>[]; edges: Edge[] } | null>(null);
+  const applyRemoteRef = useRef<(message: RemoteGraph) => void>(() => {});
   const graphRef = useRef({
     nodes,
     edges,
@@ -197,6 +220,13 @@ export default function App() {
         workflowId: workflow.id,
         parentWorkflowId: parentId,
       };
+      serverRef.current = {
+        nodes: structuredClone(nextNodes),
+        edges: structuredClone(nextEdges),
+        parentWorkflowId: parentId,
+      };
+      revisionRef.current = workflow.revision;
+      viewportDirty.current = false;
       setWorkflowId(workflow.id);
       setWorkflowName(workflow.name);
       setParentWorkflow(workflow.parent ? { id: workflow.parent.id, name: workflow.parent.name } : null);
@@ -253,28 +283,63 @@ export default function App() {
   const persist = useCallback(() => {
     const current = graphRef.current;
     const id = current.workflowId;
-    if (!id || applyingRemote.current || !hydrated.current) return Promise.resolve();
+    if (!id || !hydrated.current) return Promise.resolve();
+    if (applyingRemote.current || saveFlight.current) {
+      saveAgain.current = true;
+      return Promise.resolve();
+    }
+    const patch = diffGraph(serverRef.current, {
+      nodes: current.nodes,
+      edges: current.edges,
+      parentWorkflowId: current.parentWorkflowId,
+    });
+    const sendViewport = viewportDirty.current;
+    if (patchIsEmpty(patch, { viewport: sendViewport })) {
+      setSaveState("saved");
+      return Promise.resolve();
+    }
+    if (sendViewport) {
+      patch.viewport = current.viewport;
+      viewportDirty.current = false;
+    }
     setSaveState("saving");
+    saveFlight.current = true;
+    lastSentRef.current = {
+      nodes: structuredClone(patch.upsertNodes) as Node<FluxNodeData>[],
+      edges: structuredClone(patch.upsertEdges) as Edge[],
+    };
     return api
-      .saveGraph(id, {
-        nodes: current.nodes,
-        edges: current.edges,
-        viewport: current.viewport,
-        parentWorkflowId: current.parentWorkflowId,
-        senderId: me,
-      })
-      .then(() => {
+      .saveGraph(id, { ...patch, senderId: me })
+      .then((workflow) => {
+        if (graphRef.current.workflowId !== id) return;
+        applyRemoteRef.current({
+          workflowId: workflow.id,
+          revision: workflow.revision,
+          senderId: me,
+          graph: workflow.graph,
+        });
         if (graphRef.current.workflowId === id) setSaveState("saved");
       })
       .catch(() => {
+        if (sendViewport) viewportDirty.current = true;
         if (graphRef.current.workflowId === id) setSaveState("offline");
+      })
+      .finally(() => {
+        saveFlight.current = false;
+        if (!saveAgain.current) return;
+        saveAgain.current = false;
+        if (saveTimer.current) window.clearTimeout(saveTimer.current);
+        saveTimer.current = window.setTimeout(() => {
+          void persist();
+        }, 350);
       });
   }, [me]);
 
   const scheduleSave = useCallback(() => {
-    if (applyingRemote.current) return;
     if (saveTimer.current) window.clearTimeout(saveTimer.current);
-    saveTimer.current = window.setTimeout(persist, 350);
+    saveTimer.current = window.setTimeout(() => {
+      void persist();
+    }, 350);
   }, [persist]);
 
   const setLocalNodes = useCallback(
@@ -523,6 +588,57 @@ export default function App() {
     [setLocalEdges],
   );
 
+  applyRemoteRef.current = (message) => {
+    if (message.workflowId && message.workflowId !== graphRef.current.workflowId) return;
+    if (typeof message.revision === "number" && message.revision <= revisionRef.current) return;
+    if (!message.graph) return;
+    const previous = {
+      nodes: serverRef.current.nodes,
+      edges: serverRef.current.edges,
+    };
+    const incomingNodes = asNodes(message.graph.nodes);
+    const incomingEdges = asEdges(message.graph.edges);
+    const localNodes = graphRef.current.nodes;
+    const localEdges = graphRef.current.edges;
+    if (typeof message.revision === "number") revisionRef.current = message.revision;
+    serverRef.current = {
+      nodes: structuredClone(incomingNodes),
+      edges: structuredClone(incomingEdges),
+      parentWorkflowId:
+        message.graph.parentWorkflowId !== undefined
+          ? message.graph.parentWorkflowId || null
+          : serverRef.current.parentWorkflowId,
+    };
+    history.current = history.current.map((entry) => ({
+      nodes: foldItems(previous.nodes, incomingNodes, entry.nodes, localNodes, sameNode),
+      edges: foldItems(previous.edges, incomingEdges, entry.edges, localEdges, sameEdge),
+    }));
+    const sent = message.senderId === me ? lastSentRef.current : null;
+    if (sent) lastSentRef.current = null;
+    applyingRemote.current = true;
+    setNodes((current) => {
+      const merged = mergeItems(previous.nodes, current, incomingNodes, sameNode);
+      const adopted = sent ? preferServerCopy(merged, incomingNodes, sent.nodes, sameNode) : merged;
+      graphRef.current = { ...graphRef.current, nodes: adopted };
+      return adopted;
+    });
+    setEdges((current) => {
+      const merged = mergeItems(previous.edges, current, incomingEdges, sameEdge);
+      const adopted = sent ? preferServerCopy(merged, incomingEdges, sent.edges, sameEdge) : merged;
+      graphRef.current = { ...graphRef.current, edges: adopted };
+      return adopted;
+    });
+    queueMicrotask(() => {
+      applyingRemote.current = false;
+      if (!saveAgain.current || saveFlight.current) return;
+      saveAgain.current = false;
+      if (saveTimer.current) window.clearTimeout(saveTimer.current);
+      saveTimer.current = window.setTimeout(() => {
+        void persist();
+      }, 350);
+    });
+  };
+
   useEffect(() => {
     if (!workflowId) return;
     const protocol = location.protocol === "https:" ? "wss" : "ws";
@@ -542,19 +658,7 @@ export default function App() {
       if (message.type === "presence") {
         setPeople(message.people || []);
       }
-      if (message.type === "graph") {
-        if (message.workflowId && message.workflowId !== graphRef.current.workflowId) return;
-        if (message.senderId && message.senderId === me) return;
-        applyingRemote.current = true;
-        setNodes(asNodes(message.graph.nodes));
-        setEdges(asEdges(message.graph.edges));
-        if (message.graph.viewport) {
-          setCam(message.graph.viewport);
-        }
-        queueMicrotask(() => {
-          applyingRemote.current = false;
-        });
-      }
+      if (message.type === "graph") applyRemoteRef.current(message);
     });
     socket.addEventListener("close", () => {
       if (socketRef.current === socket) setSaveState((current) => (current === "saving" ? current : "offline"));
@@ -562,7 +666,7 @@ export default function App() {
     return () => {
       socket.close();
     };
-  }, [workflowId, me]);
+  }, [workflowId]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -739,6 +843,7 @@ export default function App() {
   const onViewportChange = useCallback(
     (next: Viewport) => {
       setCam(next);
+      viewportDirty.current = true;
       scheduleSave();
     },
     [scheduleSave],
